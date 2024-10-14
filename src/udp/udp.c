@@ -66,13 +66,19 @@ enum {
 
 #ifdef USE_UDP_RECV_BUF
 struct udp_cache_data {
+	struct le le;
   struct mbuf *mb;
   struct sa src;
+	mtx_t *lock;
 };
 
 struct udp_recv_buffer {
+	
   struct list buf_list;
+	int buf_count;
+	uint32_t buf_data_size;
   mtx_t *lock;
+	cnd_t *data_cnd;
   int thread_run;
   thrd_t threadid; // thread
 };
@@ -154,6 +160,7 @@ static void udp_destructor(void *data)
 
 	mem_deref(us->lock);
 
+
 #ifdef WIN32
 	if (us->qos && us->qos_id)
 		(void)QOSRemoveSocketFromFlow(us->qos, 0, us->qos_id, 0);
@@ -196,6 +203,35 @@ static int64_t get_current_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)(ts.tv_sec) * 1000 + (int64_t)(ts.tv_nsec) / 1000000;
+}
+
+#ifdef USE_UDP_RECV_BUF
+static int udp_recvbuffer_push_data(struct udp_recv_buffer *buf,struct sa *src, struct mbuf *data);
+#endif
+
+
+static void handle_udp_raw_data(struct udp_sock *us,struct sa *src, struct mbuf *mb)
+{
+	struct le *le;
+
+	/* call helpers */
+	mtx_lock(us->lock);
+	le = us->helpers.head;
+	mtx_unlock(us->lock);
+	while (le) {
+		struct udp_helper *uh = le->data;
+		bool hdld;
+
+		mtx_lock(us->lock);
+		le = le->next;
+		mtx_unlock(us->lock);
+
+		hdld = uh->recvh(src, mb, uh->arg);
+		if (hdld)
+			return;
+	}
+
+	us->rh(src, mb, us->arg);
 }
 
 static void udp_read(struct udp_sock *us, re_sock_t fd)
@@ -253,29 +289,39 @@ static void udp_read(struct udp_sock *us, re_sock_t fd)
 
 	(void)mbuf_resize(mb, mb->end);
 
-	/* call helpers */
-	mtx_lock(us->lock);
-	le = us->helpers.head;
-	mtx_unlock(us->lock);
-	while (le) {
-		struct udp_helper *uh = le->data;
-		bool hdld;
-
-		mtx_lock(us->lock);
-		le = le->next;
-		mtx_unlock(us->lock);
-
-		hdld = uh->recvh(&src, mb, uh->arg);
-		if (hdld)
-			goto out;
-	}
-
-	us->rh(&src, mb, us->arg);
-
- out:
-    // end_ts = get_current_ms();
-    // DEBUG_WARNING("udp read delta_ts=%d begin_ts=%"PRId64 " end_ts=%"PRId64" \n",end_ts - begin_ts, begin_ts, end_ts);
+#ifdef USE_UDP_RECV_BUF
+	udp_recvbuffer_push_data(us->recvbuf, &src, mb);
+out:
 	mem_deref(mb);
+#else
+	// /* call helpers */
+	// mtx_lock(us->lock);
+	// le = us->helpers.head;
+	// mtx_unlock(us->lock);
+	// while (le) {
+	// 	struct udp_helper *uh = le->data;
+	// 	bool hdld;
+	//
+	// 	mtx_lock(us->lock);
+	// 	le = le->next;
+	// 	mtx_unlock(us->lock);
+	//
+	// 	hdld = uh->recvh(&src, mb, uh->arg);
+	// 	if (hdld)
+	// 		goto out;
+	// }
+	//
+	// us->rh(&src, mb, us->arg);
+ // out:
+ //    // end_ts = get_current_ms();
+ //    // DEBUG_WARNING("udp read delta_ts=%d begin_ts=%"PRId64 " end_ts=%"PRId64" \n",end_ts - begin_ts, begin_ts, end_ts);
+	// mem_deref(mb);
+	
+	handle_udp_raw_data(us, &src, mb);
+out:
+	mem_deref(mb);
+#endif
+
 }
 
 
@@ -289,14 +335,23 @@ static void udp_read_handler(int flags, void *arg)
 }
 
 #ifdef USE_UDP_RECV_BUF
+static void udp_recvbuffer_thread_stop(struct udp_recv_buffer *buf);
+
 static void udp_recvbuffer_destructor(struct udp_recv_buffer *buf){
+	udp_recvbuffer_thread_stop(buf);
+
 	mtx_lock(buf->lock);
-  buf->thread_run = 0;
+	list_flush(&buf->buf_list);
 	mtx_unlock(buf->lock);
 
-  list_flush(&buf->buf_list);
 	mem_deref(buf->lock);
-  mem_deref(buf);
+	mem_deref(buf->data_cnd);
+	mem_deref(buf);
+}
+
+static void cond_decontructor(void *arg) {
+	cnd_t *c = arg;
+	cnd_destroy(c);
 }
 
 static int udp_recvbuffer_alloc(struct udp_recv_buffer **buf) {
@@ -315,6 +370,14 @@ static int udp_recvbuffer_alloc(struct udp_recv_buffer **buf) {
 		return err;
 	}
 
+	b->data_cnd = mem_alloc(sizeof(cnd_t), cond_decontructor);	
+	//TODO: check error
+	if(!b->data_cnd){
+		DEBUG_WARNING("memory alloc cnd failed\n");
+	}
+	cnd_init(b->data_cnd);
+
+
 	*buf = b;
 	return 0;
 }
@@ -322,20 +385,37 @@ static int udp_recvbuffer_alloc(struct udp_recv_buffer **buf) {
 static int udp_recvbuffer_thread_func(void *arg) {
 	struct udp_sock *us = arg;
 	struct udp_recv_buffer *rbuf = us->recvbuf;
+	struct le *le;
+
 	for(;;){
 		mtx_lock(rbuf->lock);
 		if(!rbuf->thread_run){
 			break;			
 		}	
+		if (rbuf->buf_count == 0) {
+			cnd_wait(rbuf->data_cnd, rbuf->lock);
+		}
+		le = rbuf->buf_list.head;
 		mtx_unlock(rbuf->lock);
-
+		while (le) {
+			struct udp_cache_data *d = le->data;
+			mtx_lock(rbuf->lock);
+			rbuf->buf_count --;
+			rbuf->buf_data_size -= mbuf_end(d->mb) - mbuf_pos(d->mb);
+			le = le->next;
+			list_unlink(&d->le);
+			mtx_unlock(rbuf->lock);
+			handle_udp_raw_data(us, &d->src, d->mb);
+			mem_deref(d);
+		}
+		
 	}
 
 	DEBUG_WARNING("udp recv buffer thread stop\n");
 	return 0;
 }
 
-static void udp_start_recvbuffer_thread(struct udp_sock *b) {
+static void udp_recvbuffer_thread_start(struct udp_sock *b) {
 	struct udp_recv_buffer *buf = b->recvbuf;
 	buf->thread_run = 1;
 	thrd_create(&buf->threadid, udp_recvbuffer_thread_func, b);
@@ -346,6 +426,41 @@ static void udp_recvbuffer_thread_stop(struct udp_recv_buffer *buf) {
 	mtx_lock(buf->lock);
 	buf->thread_run = 0;
 	mtx_unlock(buf->lock);
+}
+
+
+static void udp_cache_data_destructor(void *data) {
+	struct udp_cache_data *d = data;
+	mem_deref(d->mb);
+	mtx_lock(d->lock);
+	list_unlink(&d->le);
+	mtx_unlock(d->lock);
+}
+
+#define MAX_RECV_BUF_SIZE (8 * 1024 * 1024)  // 8MB
+
+static int udp_recvbuffer_push_data(struct udp_recv_buffer *buf, struct sa *src, struct mbuf *data) {
+	int err = 0;
+	int current_size = 0;
+	int current_count = 0;
+	struct udp_cache_data *d = mem_zalloc(sizeof(struct udp_cache_data), udp_cache_data_destructor);
+
+	mtx_lock(buf->lock);
+	list_append(&buf->buf_list, &d->le, d);
+	current_count = buf->buf_count++;
+	buf->buf_data_size += mbuf_end(data) -  mbuf_pos(data);
+	current_size = buf->buf_data_size;
+	mem_ref(data);
+	d->mb = data;
+	d->lock = buf->lock;
+	sa_cpy(&d->src, src);
+	cnd_broadcast(buf->data_cnd);
+	mtx_unlock(buf->lock);
+
+	if (current_count >= 50 || current_size >= MAX_RECV_BUF_SIZE) {
+		DEBUG_WARNING("udp buffer too large !!! size %d, count %d\n", current_size, current_count);
+	}
+	return err;
 }
 #endif
 
@@ -508,7 +623,7 @@ int udp_listen(struct udp_sock **usp, const struct sa *local,
 		/* OK */
 		us->fd = fd;
 #ifdef USE_UDP_RECV_BUF
-    udp_start_recvbuffer_thread(us);
+    udp_recvbuffer_thread_start(us);
 #endif
 		break;
 	}
