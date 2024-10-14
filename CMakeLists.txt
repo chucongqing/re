@@ -21,7 +21,7 @@ project(re
 )
 
 set(PROJECT_SOVERSION 27) # bump if ABI breaks
-
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Pre-release identifier, comment out on a release
 # Increment for breaking changes (dev2, dev3...)
 #set(PROJECT_VERSION_PRE dev)
@@ -107,6 +107,7 @@ list(APPEND RE_DEFINITIONS
   -DVER_MINOR=${PROJECT_VERSION_MINOR}
   -DVER_PATCH=${PROJECT_VERSION_PATCH}
   -D_GNU_SOURCE
+  -DUSE_UDP_RECV_BUF
 )
 
 if(DEFINED TRACE_SSL)

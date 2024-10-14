@@ -208,7 +208,7 @@ static void udp_recv_handler(const struct sa *src, struct mbuf *mb, void *arg)
 #ifdef RE_RTP_PCAP
 	re_text2pcap_trace("rtp_udp_recv", "RTP", true, mb);
 #endif
-
+  
 	err = rtp_decode(rs, mb, &hdr);
 	if (err)
 		return;

@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2010 Creytiv.com
  */
+#include <stdint.h>
 #include <stdlib.h>
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -63,6 +64,19 @@ enum {
 	UDP_RXSZ_DEFAULT = 8192
 };
 
+#ifdef USE_UDP_RECV_BUF
+struct udp_cache_data {
+  struct mbuf *mb;
+  struct sa src;
+};
+
+struct udp_recv_buffer {
+  struct list buf_list;
+  mtx_t *lock;
+  int thread_run;
+  thrd_t threadid; // thread
+};
+#endif
 
 /** Defines a UDP socket */
 struct udp_sock {
@@ -81,6 +95,10 @@ struct udp_sock {
 	QOS_FLOWID qos_id;   /**< QOS flow id                 */
 #endif
 	mtx_t *lock;         /**< A lock for helpers list     */
+
+#ifdef USE_UDP_RECV_BUF
+  struct udp_recv_buffer *recvbuf;
+#endif
 };
 
 /** Defines a UDP helper */
@@ -124,6 +142,10 @@ static bool helper_recv_handler(struct sa *src,
 }
 
 
+#ifdef USE_UDP_RECV_BUF
+static void udp_recvbuffer_destructor(struct udp_recv_buffer *buf);
+#endif
+
 static void udp_destructor(void *data)
 {
 	struct udp_sock *us = data;
@@ -139,12 +161,42 @@ static void udp_destructor(void *data)
 		(void)QOSCloseHandle(us->qos);
 #endif
 
+#ifdef USE_UDP_RECV_BUF
+	udp_recvbuffer_destructor(us->recvbuf);
+#endif
+
 	if (RE_BAD_SOCK != us->fd) {
 		us->fhs = fd_close(us->fhs);
 		(void)close(us->fd);
 	}
 }
 
+
+static uint16_t get_rtp_seq(const void* data, size_t length) {
+    const uint8_t* rtp_packet = (const uint8_t*)data;
+    
+    // Check if we have at least 4 bytes (for RTP header with sequence number)
+    if (length < 4) {
+        return 0; // Not enough data for a valid RTP packet
+    }
+
+    // Check RTP version (first 2 bits should be 10 for RTP version 2)
+    if ((rtp_packet[0] & 0xC0) != 0x80) {
+        return 0; // Not a valid RTP packet
+    }
+
+    // The sequence number is in the 3rd and 4th bytes of the RTP header
+    uint16_t seq = (rtp_packet[2] << 8) | rtp_packet[3];
+
+    // No need to convert byte order as we're working directly with the network order
+    return seq;
+}
+
+static int64_t get_current_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)(ts.tv_sec) * 1000 + (int64_t)(ts.tv_nsec) / 1000000;
+}
 
 static void udp_read(struct udp_sock *us, re_sock_t fd)
 {
@@ -153,6 +205,9 @@ static void udp_read(struct udp_sock *us, re_sock_t fd)
 	struct le *le;
 	int err = 0;
 	ssize_t n;
+  // int64_t end_ts = 0;
+  // int64_t begin_ts = get_current_ms();
+  // DEBUG_WARNING("begin ts:%" PRId64 "\n", begin_ts);
 
 	if (!mb)
 		return;
@@ -185,6 +240,17 @@ static void udp_read(struct udp_sock *us, re_sock_t fd)
 	mb->pos = us->rx_presz;
 	mb->end = n + us->rx_presz;
 
+  // int seq = get_rtp_seq(mb->buf + us->rx_presz, n);
+  // if (us->last_rtp_seq == 0) {
+  //   us->last_rtp_seq = seq;
+  // } else {
+  //   int delta = seq - us->last_rtp_seq;
+  //   if (delta != 1) {
+  //     // DEBUG_WARNING("udp recv delta=%d, seq=%d, last=%d\n", delta, seq, us->last_rtp_seq);
+  //   }
+  //   us->last_rtp_seq = seq;
+  // }
+
 	(void)mbuf_resize(mb, mb->end);
 
 	/* call helpers */
@@ -207,6 +273,8 @@ static void udp_read(struct udp_sock *us, re_sock_t fd)
 	us->rh(&src, mb, us->arg);
 
  out:
+    // end_ts = get_current_ms();
+    // DEBUG_WARNING("udp read delta_ts=%d begin_ts=%"PRId64 " end_ts=%"PRId64" \n",end_ts - begin_ts, begin_ts, end_ts);
 	mem_deref(mb);
 }
 
@@ -220,6 +288,66 @@ static void udp_read_handler(int flags, void *arg)
 	udp_read(us, us->fd);
 }
 
+#ifdef USE_UDP_RECV_BUF
+static void udp_recvbuffer_destructor(struct udp_recv_buffer *buf){
+	mtx_lock(buf->lock);
+  buf->thread_run = 0;
+	mtx_unlock(buf->lock);
+
+  list_flush(&buf->buf_list);
+	mem_deref(buf->lock);
+  mem_deref(buf);
+}
+
+static int udp_recvbuffer_alloc(struct udp_recv_buffer **buf) {
+	struct udp_recv_buffer *b = mem_zalloc(sizeof(struct udp_recv_buffer), NULL);
+	int err;
+
+	if(!b) {
+		return ENOMEM;
+	}
+
+	list_init(&b->buf_list);
+
+	err =mutex_alloc(&b->lock);
+	if (err) {
+		mem_deref(b);
+		return err;
+	}
+
+	*buf = b;
+	return 0;
+}
+
+static int udp_recvbuffer_thread_func(void *arg) {
+	struct udp_sock *us = arg;
+	struct udp_recv_buffer *rbuf = us->recvbuf;
+	for(;;){
+		mtx_lock(rbuf->lock);
+		if(!rbuf->thread_run){
+			break;			
+		}	
+		mtx_unlock(rbuf->lock);
+
+	}
+
+	DEBUG_WARNING("udp recv buffer thread stop\n");
+	return 0;
+}
+
+static void udp_start_recvbuffer_thread(struct udp_sock *b) {
+	struct udp_recv_buffer *buf = b->recvbuf;
+	buf->thread_run = 1;
+	thrd_create(&buf->threadid, udp_recvbuffer_thread_func, b);
+	thrd_detach(buf->threadid);
+}
+
+static void udp_recvbuffer_thread_stop(struct udp_recv_buffer *buf) {
+	mtx_lock(buf->lock);
+	buf->thread_run = 0;
+	mtx_unlock(buf->lock);
+}
+#endif
 
 static int udp_alloc(struct udp_sock **usp)
 {
@@ -235,6 +363,9 @@ static int udp_alloc(struct udp_sock **usp)
 
 	list_init(&us->helpers);
 
+#ifdef USE_UDP_RECV_BUF
+  udp_recvbuffer_alloc(&us->recvbuf);
+#endif
 	us->fhs	 = NULL;
 	us->fd	 = RE_BAD_SOCK;
 
@@ -251,6 +382,38 @@ static int udp_alloc(struct udp_sock **usp)
 	return 0;
 }
 
+#define DESIRED_RECV_BUF_SIZE (5 * 1024 * 1024)  // 5MB
+
+static int set_socket_recv_buffer_size(int sockfd, int size) {
+    int current_size = 0;
+    socklen_t optlen = sizeof(current_size);
+
+    // Get the current receive buffer size
+    if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &current_size, &optlen) < 0) {
+        perror("getsockopt");
+        return -1;
+    }
+    DEBUG_WARNING("Current receive buffer size: %d bytes\n", current_size);
+
+    // Set the new receive buffer size
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0) {
+        DEBUG_WARNING("setsockopt");
+        return -1;
+    }
+
+    // Verify the new size
+    if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &current_size, &optlen) < 0) {
+        DEBUG_WARNING("getsockopt");
+        return -1;
+    }
+    DEBUG_WARNING("New receive buffer size: %d bytes\n", current_size);
+
+    if (current_size != size) {
+        DEBUG_WARNING("Warning: Requested size %d bytes, but actual size is %d bytes\n", size, current_size);
+    }
+
+    return 0;
+}
 
 /**
  * Create and listen on a UDP Socket
@@ -329,6 +492,8 @@ int udp_listen(struct udp_sock **usp, const struct sa *local,
 			continue;
 		}
 
+    set_socket_recv_buffer_size(fd, DESIRED_RECV_BUF_SIZE);
+
 		/* use dual socket */
 		if (r->ai_family == AF_INET6)
 			(void)net_sockopt_v6only(fd, false);
@@ -342,6 +507,9 @@ int udp_listen(struct udp_sock **usp, const struct sa *local,
 
 		/* OK */
 		us->fd = fd;
+#ifdef USE_UDP_RECV_BUF
+    udp_start_recvbuffer_thread(us);
+#endif
 		break;
 	}
 

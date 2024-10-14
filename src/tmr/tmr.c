@@ -19,7 +19,7 @@
 
 
 #define DEBUG_MODULE "tmr"
-#define DEBUG_LEVEL 5
+#define DEBUG_LEVEL 6
 #include <re_dbg.h>
 
 #ifdef WIN32
