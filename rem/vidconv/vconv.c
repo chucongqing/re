@@ -11,6 +11,10 @@
 #include <rem_vidconv.h>
 
 
+#define DEBUG_MODULE "rem_vconc"
+#define DEBUG_LEVEL 5
+#include <re_dbg.h>
+
 #if 0
 
 /*
@@ -538,6 +542,17 @@ static void nv21_to_yuv420p(unsigned xsoffs, unsigned xdoffs, unsigned width,
 	unsigned x, xd, xs, xs2;
 	unsigned id, is;
 
+  if (dd0 == NULL) {
+    DEBUG_WARNING("nv21_to_yuv420p: dd0 == NULL\n");
+  }
+  if (dd1 == NULL) {
+    DEBUG_WARNING("nv21_to_yuv420p: dd1 == NULL\n");
+  }
+  if (dd2 == NULL) {
+    DEBUG_WARNING("nv21_to_yuv420p: dd2 == NULL\n");
+  }
+
+  DEBUG_WARNING("nv21_to_yuv420p: width = %d\n", width);
 	(void)ds2;
 
 	for (x=0; x<width; x+=2) {
@@ -724,6 +739,8 @@ void vidconv(struct vidframe *dst, const struct vidframe *src,
 	double rw, rh;
 	line_h *lineh = NULL;
 
+
+
 	if (!vidframe_isvalid(dst) || !vidframe_isvalid(src))
 		return;
 
@@ -759,12 +776,15 @@ void vidconv(struct vidframe *dst, const struct vidframe *src,
 		r = &rdst;
 	}
 
+	DEBUG_WARNING("vidrect x=%d,y=%d,w=%d,h=%d\n", r->x, r->y, r->w, r->h);
+
 	rw = (double)src->size.w / (double)r->w;
 	rh = (double)src->size.h / (double)r->h;
 
 	lsd = dst->linesize[0];
 	lss = src->linesize[0];
 
+	DEBUG_WARNING("lsd=%d,lss=%d\n", lsd, lss);
 	dd0 = dst->data[0];
 	dd1 = dst->data[1];
 	dd2 = dst->data[2];

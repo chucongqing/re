@@ -182,7 +182,8 @@ int main(int argc, char *argv[])
 #if defined(WIN32)
 	flags = 0;
 #else
-	flags = DBG_ANSI;
+	 flags = DBG_ANSI;
+	//flags = 0;
 #endif
 
 	dbg_init(DBG_INFO, flags);

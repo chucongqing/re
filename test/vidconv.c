@@ -91,6 +91,10 @@ static int test_vid_rgb2yuv(void)
 	return err;
 }
 
+static int test_vid_nv21toyuv(void)
+{
+}
+
 
 static bool vidframe_cmp(const struct vidframe *a, const struct vidframe *b)
 {
@@ -422,6 +426,27 @@ out:
 }
 
 
+static int test_vidconv_nv21toyuv420(void) {
+
+	struct vidframe *dst = NULL;
+	struct vidframe *src = NULL;
+	struct vidsz src_sz = {.w = 1280, .h = 720};
+	struct vidsz dst_sz = {.w = 1280, .h = 720};
+	int err;
+		err = vidframe_alloc(&src, VID_FMT_NV21, &src_sz);
+		err |= vidframe_alloc(&dst, VID_FMT_YUV420P, &dst_sz);
+	TEST_ERR(err);
+
+	vidconv(dst, src, NULL);
+
+out:
+	src = mem_deref(src);
+	dst = mem_deref(dst);
+
+	DEBUG_WARNING("test_vidconv_nv21toyuv420  err = %d\n", err);
+	return err;
+}
+
 int test_vidconv(void)
 {
 	int err;
@@ -430,6 +455,9 @@ int test_vidconv(void)
 	TEST_ERR(err);
 
 	err = test_vidconv_center();
+	TEST_ERR(err);
+
+	err = test_vidconv_nv21toyuv420();
 	TEST_ERR(err);
 
 out:
